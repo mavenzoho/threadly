@@ -5,14 +5,27 @@ import * as os from 'os';
 import * as crypto from 'crypto';
 
 type Entry =
-  | { kind: 'file'; uri: string }
+  | { kind: 'file'; uri: string; viewType?: string; label?: string }
   | { kind: 'chat'; label: string; viewType: string; sessionId?: string };
 
 type GroupsState = Record<string, Entry[]>;
+type ColorsState = Record<string, string>;
 
 const STATE_KEY = 'editorGroups.groups.v2';
 const ORDER_KEY = 'editorGroups.order.v1';
+const COLORS_KEY = 'editorGroups.colors.v1';
 const LEGACY_KEY = 'editorGroups.groups';
+
+const THREAD_COLORS = [
+  { name: 'Default', themeColor: undefined as string | undefined },
+  { name: 'Red', themeColor: 'charts.red' },
+  { name: 'Orange', themeColor: 'charts.orange' },
+  { name: 'Yellow', themeColor: 'charts.yellow' },
+  { name: 'Green', themeColor: 'charts.green' },
+  { name: 'Blue', themeColor: 'charts.blue' },
+  { name: 'Purple', themeColor: 'charts.purple' },
+  { name: 'Pink', themeColor: 'terminal.ansiMagenta' },
+] as const;
 
 function extractUri(input: unknown): vscode.Uri | undefined {
   if (input instanceof vscode.TabInputText) return input.uri;
@@ -21,6 +34,21 @@ function extractUri(input: unknown): vscode.Uri | undefined {
   if (input instanceof vscode.TabInputNotebook) return input.uri;
   if (input instanceof vscode.TabInputNotebookDiff) return input.modified;
   return undefined;
+}
+
+function extractViewType(input: unknown): string | undefined {
+  if (input instanceof vscode.TabInputCustom) return input.viewType;
+  if (input instanceof vscode.TabInputWebview) return input.viewType;
+  return undefined;
+}
+
+const AI_CUSTOM_EDITOR_VIEWTYPES: { match: RegExp; renderer: 'chat'; tool: string }[] = [
+  { match: /chatgpt\.conversationEditor/i, renderer: 'chat', tool: 'codex' },
+];
+
+function isAICustomEditor(input: unknown): boolean {
+  if (!(input instanceof vscode.TabInputCustom)) return false;
+  return AI_CUSTOM_EDITOR_VIEWTYPES.some((r) => r.match.test(input.viewType));
 }
 
 function isChatWebview(input: unknown): input is vscode.TabInputWebview {
@@ -212,6 +240,160 @@ async function loadChatSessionMap(): Promise<Map<string, string>> {
   return (await loadSessionLookup()).byTitle;
 }
 
+type HistoryItem = {
+  sessionId: string;
+  title: string;
+  tool: 'claude' | 'codex';
+  mtimeMs: number;
+  relativeTime: string;
+  uri?: string;
+};
+
+function relativeTimeAgo(ms: number): string {
+  const diff = Date.now() - ms;
+  const min = Math.floor(diff / 60000);
+  if (min < 1) return 'just now';
+  if (min < 60) return `${min}m ago`;
+  const hr = Math.floor(min / 60);
+  if (hr < 24) return `${hr}h ago`;
+  const d = Math.floor(hr / 24);
+  if (d < 30) return `${d}d ago`;
+  const mo = Math.floor(d / 30);
+  if (mo < 12) return `${mo}mo ago`;
+  return `${Math.floor(mo / 12)}y ago`;
+}
+
+function claudeProjectDirName(workspacePath: string): string {
+  // Claude uses a slug derived from the absolute path: D:\New folder (2) -> d--New-folder--2-
+  // Replace non-alphanumerics with `-`, lowercase the drive letter prefix.
+  return workspacePath
+    .replace(/[\\/:]/g, '-')
+    .replace(/[^a-zA-Z0-9-]/g, '-')
+    .replace(/-+/g, '-')
+    .toLowerCase();
+}
+
+async function collectChatHistory(workspacePath: string): Promise<HistoryItem[]> {
+  const items: HistoryItem[] = [];
+
+  // 1) Claude sessions: ~/.claude/projects/<slug>/*.jsonl
+  try {
+    const claudeRoot = path.join(os.homedir(), '.claude', 'projects');
+    if (fs.existsSync(claudeRoot)) {
+      const wantedSlug = claudeProjectDirName(workspacePath);
+      let projectDir: string | undefined;
+      for (const entry of fs.readdirSync(claudeRoot)) {
+        if (entry.toLowerCase() === wantedSlug || entry.toLowerCase().includes(wantedSlug)) {
+          projectDir = path.join(claudeRoot, entry);
+          break;
+        }
+      }
+      if (projectDir && fs.existsSync(projectDir)) {
+        for (const f of fs.readdirSync(projectDir)) {
+          if (!f.endsWith('.jsonl')) continue;
+          const sessionId = f.slice(0, -6);
+          const fp = path.join(projectDir, f);
+          try {
+            const stat = fs.statSync(fp);
+            // Grab first user message text or first ~120 chars for title
+            let title = sessionId.slice(0, 8);
+            const text = fs.readFileSync(fp, 'utf8').slice(0, 8000);
+            const m = text.match(/"role"\s*:\s*"user"[\s\S]{0,500}?"content"\s*:\s*"((?:[^"\\]|\\.){5,200})"/);
+            if (m) {
+              try {
+                title = JSON.parse('"' + m[1] + '"').replace(/\s+/g, ' ').trim().slice(0, 80);
+              } catch {
+                // ignore
+              }
+            } else {
+              const tm = text.match(/"content"\s*:\s*\[\s*\{\s*"type"\s*:\s*"text"\s*,\s*"text"\s*:\s*"((?:[^"\\]|\\.){5,200})"/);
+              if (tm) {
+                try {
+                  title = JSON.parse('"' + tm[1] + '"').replace(/\s+/g, ' ').trim().slice(0, 80);
+                } catch {
+                  // ignore
+                }
+              }
+            }
+            items.push({
+              sessionId,
+              title,
+              tool: 'claude',
+              mtimeMs: stat.mtimeMs,
+              relativeTime: relativeTimeAgo(stat.mtimeMs),
+            });
+          } catch {
+            // skip
+          }
+        }
+      }
+    }
+  } catch {
+    // skip
+  }
+
+  // 2) Codex sessions: stored under ~/.codex/sessions or similar. We'll do best-effort.
+  try {
+    const codexCandidates = [
+      path.join(os.homedir(), '.codex'),
+      path.join(os.homedir(), '.openai-codex'),
+      process.env.APPDATA && path.join(process.env.APPDATA, 'Codex'),
+    ].filter(Boolean) as string[];
+    for (const root of codexCandidates) {
+      if (!fs.existsSync(root)) continue;
+      const walk = (dir: string, depth: number) => {
+        if (depth > 4) return;
+        let entries: fs.Dirent[] = [];
+        try {
+          entries = fs.readdirSync(dir, { withFileTypes: true });
+        } catch {
+          return;
+        }
+        for (const e of entries) {
+          const p = path.join(dir, e.name);
+          if (e.isDirectory()) {
+            walk(p, depth + 1);
+          } else if (/\.(json|jsonl)$/.test(e.name) && /thread|session|conversation/i.test(p)) {
+            try {
+              const stat = fs.statSync(p);
+              const text = fs.readFileSync(p, 'utf8').slice(0, 4000);
+              const idMatch = text.match(/"(?:threadId|sessionId|conversationId|id)"\s*:\s*"([0-9a-f-]{12,})"/i);
+              const titleMatch = text.match(/"(?:title|name|summary)"\s*:\s*"((?:[^"\\]|\\.){3,120})"/);
+              if (idMatch) {
+                let title = idMatch[1].slice(0, 8);
+                if (titleMatch) {
+                  try {
+                    title = JSON.parse('"' + titleMatch[1] + '"').trim().slice(0, 80);
+                  } catch {
+                    // skip
+                  }
+                }
+                items.push({
+                  sessionId: idMatch[1],
+                  title,
+                  tool: 'codex',
+                  mtimeMs: stat.mtimeMs,
+                  relativeTime: relativeTimeAgo(stat.mtimeMs),
+                  uri: `openai-codex:/${idMatch[1]}`,
+                });
+              }
+            } catch {
+              // skip
+            }
+          }
+        }
+      };
+      walk(root, 0);
+    }
+  } catch {
+    // skip
+  }
+
+  // Newest first
+  items.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  return items;
+}
+
 function fuzzyMatchTitle(tabLabel: string, byTitle: Map<string, string>): string | undefined {
   // Direct hit
   if (byTitle.has(tabLabel)) return byTitle.get(tabLabel);
@@ -236,26 +418,56 @@ function chatOpenCommand(viewType: string): { command: string; args?: unknown[] 
 }
 
 class GroupItem extends vscode.TreeItem {
-  constructor(public readonly name: string, count: number) {
+  constructor(
+    public readonly name: string,
+    count: number,
+    public readonly themeColor?: string,
+  ) {
     super(name, vscode.TreeItemCollapsibleState.Expanded);
     this.contextValue = 'group';
-    this.iconPath = new vscode.ThemeIcon('organization');
+    this.iconPath = new vscode.ThemeIcon(
+      'organization',
+      themeColor ? new vscode.ThemeColor(themeColor) : undefined,
+    );
     this.description = `${count}`;
   }
 }
 
 class FileItem extends vscode.TreeItem {
-  constructor(public readonly uri: vscode.Uri, public readonly groupName: string) {
-    super(path.basename(uri.fsPath), vscode.TreeItemCollapsibleState.None);
-    this.contextValue = 'file';
-    this.resourceUri = uri;
-    this.tooltip = uri.fsPath;
-    this.description = vscode.workspace.asRelativePath(path.dirname(uri.fsPath));
-    this.command = {
-      command: 'vscode.open',
-      title: 'Open',
-      arguments: [uri],
-    };
+  constructor(
+    public readonly uri: vscode.Uri,
+    public readonly groupName: string,
+    public readonly viewType?: string,
+    storedLabel?: string,
+  ) {
+    const isAIScheme = uri.scheme === 'openai-codex' || uri.scheme === 'cursor';
+    const displayLabel =
+      storedLabel || (isAIScheme ? uri.path.replace(/^\/+/, '') || 'Codex chat' : path.basename(uri.fsPath));
+    super(displayLabel, vscode.TreeItemCollapsibleState.None);
+
+    if (isAIScheme) {
+      this.contextValue = 'chat';
+      this.iconPath = new vscode.ThemeIcon('comment-discussion');
+      this.description = 'Codex';
+      this.tooltip = `Codex chat\n${uri.toString()}`;
+    } else {
+      this.contextValue = 'file';
+      this.resourceUri = uri;
+      this.tooltip = uri.fsPath;
+      this.description = vscode.workspace.asRelativePath(path.dirname(uri.fsPath));
+    }
+
+    this.command = viewType
+      ? {
+          command: 'vscode.openWith',
+          title: 'Open',
+          arguments: [uri, viewType, { preserveFocus: false, preview: false }],
+        }
+      : {
+          command: 'vscode.open',
+          title: 'Open',
+          arguments: [uri],
+        };
   }
 }
 
@@ -324,7 +536,6 @@ class EditorGroupsProvider
     const stored = this.context.workspaceState.get<string[]>(ORDER_KEY, []);
     const groups = this.getGroups();
     const keys = new Set(Object.keys(groups));
-    // Keep stored order for known groups, append any new ones at the end
     const ordered = stored.filter((n) => keys.has(n));
     for (const k of Object.keys(groups).sort()) {
       if (!ordered.includes(k)) ordered.push(k);
@@ -337,6 +548,18 @@ class EditorGroupsProvider
     this.refresh();
   }
 
+  getColors(): ColorsState {
+    return this.context.workspaceState.get<ColorsState>(COLORS_KEY, {});
+  }
+
+  async setColor(name: string, themeColor: string | undefined): Promise<void> {
+    const colors = this.getColors();
+    if (themeColor) colors[name] = themeColor;
+    else delete colors[name];
+    await this.context.workspaceState.update(COLORS_KEY, colors);
+    this.refresh();
+  }
+
   async setGroups(groups: GroupsState): Promise<void> {
     await this.context.workspaceState.update(STATE_KEY, groups);
     this.refresh();
@@ -346,7 +569,6 @@ class EditorGroupsProvider
     if (!newName || newName === oldName) return false;
     const groups = this.getGroups();
     if (groups[newName]) return false;
-    // Preserve order by rebuilding both maps in original order
     const newGroups: GroupsState = {};
     const order = this.getOrder();
     for (const n of order) {
@@ -354,8 +576,14 @@ class EditorGroupsProvider
       newGroups[target] = groups[n];
     }
     const newOrder = order.map((n) => (n === oldName ? newName : n));
+    const colors = this.getColors();
+    if (colors[oldName]) {
+      colors[newName] = colors[oldName];
+      delete colors[oldName];
+    }
     await this.context.workspaceState.update(STATE_KEY, newGroups);
     await this.context.workspaceState.update(ORDER_KEY, newOrder);
+    await this.context.workspaceState.update(COLORS_KEY, colors);
     this.refresh();
     return true;
   }
@@ -367,11 +595,13 @@ class EditorGroupsProvider
   getChildren(element?: Node): Node[] {
     const groups = this.getGroups();
     if (!element) {
-      return this.getOrder().map((n) => new GroupItem(n, groups[n].length));
+      const colors = this.getColors();
+      return this.getOrder().map((n) => new GroupItem(n, groups[n].length, colors[n]));
     }
     if (element instanceof GroupItem) {
       return (groups[element.name] || []).map((e) => {
-        if (e.kind === 'file') return new FileItem(vscode.Uri.parse(e.uri), element.name);
+        if (e.kind === 'file')
+          return new FileItem(vscode.Uri.parse(e.uri), element.name, e.viewType, e.label);
         return new ChatItem(e.label, e.viewType, element.name, e.sessionId);
       });
     }
@@ -384,7 +614,12 @@ class EditorGroupsProvider
       if (s instanceof FileItem) {
         payload.push({
           kind: 'entry',
-          entry: { kind: 'file', uri: s.uri.toString() },
+          entry: {
+            kind: 'file',
+            uri: s.uri.toString(),
+            viewType: s.viewType,
+            label: typeof s.label === 'string' ? s.label : undefined,
+          },
           from: s.groupName,
         });
       } else if (s instanceof ChatItem) {
@@ -636,6 +871,86 @@ export function activate(context: vscode.ExtensionContext) {
       await provider.setOrder(order);
     }),
 
+    vscode.commands.registerCommand('editorGroups.setColor', async (item?: GroupItem) => {
+      let target = item;
+      if (!target) {
+        const sel = treeView.selection.find((n) => n instanceof GroupItem) as GroupItem | undefined;
+        if (!sel) {
+          vscode.window.showInformationMessage('Select a Thread first.');
+          return;
+        }
+        target = sel;
+      }
+      const picked = await vscode.window.showQuickPick(
+        THREAD_COLORS.map((c) => ({
+          label: c.themeColor
+            ? `$(circle-filled) ${c.name}`
+            : `$(circle-outline) ${c.name}`,
+          description: c.themeColor ?? 'no color',
+          themeColor: c.themeColor,
+        })),
+        { placeHolder: `Pick a color for "${target.name}"` },
+      );
+      if (!picked) return;
+      await provider.setColor(target.name, picked.themeColor);
+    }),
+
+    vscode.commands.registerCommand('editorGroups.browseChatHistory', async () => {
+      const wsFolder = vscode.workspace.workspaceFolders?.[0];
+      if (!wsFolder) {
+        vscode.window.showInformationMessage('No workspace folder open.');
+        return;
+      }
+      const items = await collectChatHistory(wsFolder.uri.fsPath);
+      if (items.length === 0) {
+        vscode.window.showInformationMessage(
+          'No past chats found for this workspace. (Looked in ~/.claude/projects)',
+        );
+        return;
+      }
+      const picked = await vscode.window.showQuickPick(
+        items.map((it) => ({
+          label: `$(${it.tool === 'codex' ? 'rocket' : 'comment-discussion'}) ${it.title}`,
+          description: `${it.tool} · ${it.relativeTime}`,
+          detail: it.sessionId.slice(0, 8),
+          payload: it,
+        })),
+        {
+          placeHolder: `Found ${items.length} past chats — pick one (or many) to add to a Thread`,
+          canPickMany: true,
+          matchOnDescription: true,
+          matchOnDetail: true,
+        },
+      );
+      if (!picked || picked.length === 0) return;
+      const group = await pickGroup(provider, 'Add selected chats to which Thread?');
+      if (!group) return;
+      const groups = provider.getGroups();
+      let added = 0;
+      for (const p of picked) {
+        const it = p.payload;
+        const entry: Entry =
+          it.tool === 'codex'
+            ? {
+                kind: 'file',
+                uri: it.uri!,
+                viewType: 'chatgpt.conversationEditor',
+                label: it.title,
+              }
+            : {
+                kind: 'chat',
+                label: it.title,
+                viewType: 'mainThreadWebview-claudeVSCodePanel',
+                sessionId: it.sessionId,
+              };
+        if (addEntry(groups, group, entry)) added++;
+      }
+      await provider.setGroups(groups);
+      vscode.window.showInformationMessage(
+        `Added ${added} past chat${added === 1 ? '' : 's'} to "${group}".`,
+      );
+    }),
+
     vscode.commands.registerCommand('editorGroups.addCurrentFile', async () => {
       const activeTab = vscode.window.tabGroups.activeTabGroup.activeTab;
       if (!activeTab) {
@@ -645,7 +960,13 @@ export function activate(context: vscode.ExtensionContext) {
       const uri = extractUri(activeTab.input);
       let entry: Entry | undefined;
       if (uri) {
-        entry = { kind: 'file', uri: uri.toString() };
+        const viewType = extractViewType(activeTab.input);
+        entry = {
+          kind: 'file',
+          uri: uri.toString(),
+          viewType: isAICustomEditor(activeTab.input) ? viewType : undefined,
+          label: isAICustomEditor(activeTab.input) ? activeTab.label : undefined,
+        };
       } else if (isChatWebview(activeTab.input)) {
         const titleMap = await loadChatSessionMap();
         entry = {
@@ -695,7 +1016,19 @@ export function activate(context: vscode.ExtensionContext) {
           for (const tab of tabGroup.tabs) {
             const uri = extractUri(tab.input);
             if (uri) {
-              if (addEntry(groups, group, { kind: 'file', uri: uri.toString() })) addedFiles++;
+              const vt = extractViewType(tab.input);
+              const isAI = isAICustomEditor(tab.input);
+              if (
+                addEntry(groups, group, {
+                  kind: 'file',
+                  uri: uri.toString(),
+                  viewType: isAI ? vt : undefined,
+                  label: isAI ? tab.label : undefined,
+                })
+              ) {
+                if (isAI) addedChats++;
+                else addedFiles++;
+              }
               continue;
             }
             if (isChatWebview(tab.input)) {

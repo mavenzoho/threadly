@@ -2,7 +2,7 @@
   "name": "threadly",
   "displayName": "Threadly — Group AI Chats & Files",
   "description": "Group your AI chat threads and the files that go with them. Click a saved chat to jump back to that exact Claude session. Works alongside the native Open Editors panel.",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "publisher": "tarekali",
   "repository": {
     "type": "git",
@@ -113,6 +113,16 @@
         "command": "editorGroups.moveGroupDown",
         "title": "Move Thread Down",
         "icon": "$(arrow-down)"
+      },
+      {
+        "command": "editorGroups.setColor",
+        "title": "Set Thread Color",
+        "icon": "$(symbol-color)"
+      },
+      {
+        "command": "editorGroups.browseChatHistory",
+        "title": "Threadly: Browse Past Chats…",
+        "icon": "$(history)"
       }
     ],
     "keybindings": [
@@ -140,9 +150,14 @@
           "group": "navigation@3"
         },
         {
-          "command": "editorGroups.refresh",
+          "command": "editorGroups.browseChatHistory",
           "when": "view == threadly",
           "group": "navigation@4"
+        },
+        {
+          "command": "editorGroups.refresh",
+          "when": "view == threadly",
+          "group": "navigation@5"
         }
       ],
       "view/item/context": [
@@ -175,6 +190,11 @@
           "command": "editorGroups.moveGroupDown",
           "when": "view == threadly && viewItem == group",
           "group": "1_modify@4"
+        },
+        {
+          "command": "editorGroups.setColor",
+          "when": "view == threadly && viewItem == group",
+          "group": "1_modify@5"
         },
         {
           "command": "editorGroups.closeGroup",
