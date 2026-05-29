@@ -392,12 +392,12 @@ async function pickGroup(
     description: `${groups[n].length} items`,
   }));
   if (allowNew) {
-    items.unshift({ label: '$(new-folder) New Sidekick...', description: 'Create a new Sidekick' });
+    items.unshift({ label: '$(new-folder) New Thread...', description: 'Create a new Thread' });
   }
   const picked = await vscode.window.showQuickPick(items, { placeHolder: placeholder });
   if (!picked) return undefined;
   if (picked.label.startsWith('$(new-folder)')) {
-    const name = await vscode.window.showInputBox({ prompt: 'Sidekick name' });
+    const name = await vscode.window.showInputBox({ prompt: 'Thread name' });
     if (!name) return undefined;
     if (!groups[name]) {
       groups[name] = [];
@@ -501,11 +501,11 @@ export function activate(context: vscode.ExtensionContext) {
     }),
 
     vscode.commands.registerCommand('editorGroups.createGroup', async () => {
-      const name = await vscode.window.showInputBox({ prompt: 'New Sidekick name' });
+      const name = await vscode.window.showInputBox({ prompt: 'New Thread name' });
       if (!name) return;
       const groups = provider.getGroups();
       if (groups[name]) {
-        vscode.window.showWarningMessage(`Sidekick "${name}" already exists.`);
+        vscode.window.showWarningMessage(`Thread "${name}" already exists.`);
         return;
       }
       groups[name] = [];
@@ -520,7 +520,7 @@ export function activate(context: vscode.ExtensionContext) {
       if (!newName || newName === item.name) return;
       const groups = provider.getGroups();
       if (groups[newName]) {
-        vscode.window.showWarningMessage(`Sidekick "${newName}" already exists.`);
+        vscode.window.showWarningMessage(`Thread "${newName}" already exists.`);
         return;
       }
       groups[newName] = groups[item.name];
@@ -530,7 +530,7 @@ export function activate(context: vscode.ExtensionContext) {
 
     vscode.commands.registerCommand('editorGroups.deleteGroup', async (item: GroupItem) => {
       const confirm = await vscode.window.showWarningMessage(
-        `Delete Sidekick "${item.name}"? (Files & chat tabs stay open.)`,
+        `Delete Thread "${item.name}"? (Files & chat tabs stay open.)`,
         { modal: true },
         'Delete',
       );
@@ -564,7 +564,7 @@ export function activate(context: vscode.ExtensionContext) {
         );
         return;
       }
-      const group = await pickGroup(provider, 'Add to which Sidekick?');
+      const group = await pickGroup(provider, 'Add to which Thread?');
       if (!group) return;
       const groups = provider.getGroups();
       addEntry(groups, group, entry);
@@ -574,7 +574,7 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand('editorGroups.addFileToGroup', async (uri?: vscode.Uri) => {
       const target = uri ?? vscode.window.activeTextEditor?.document.uri;
       if (!target) return;
-      const group = await pickGroup(provider, 'Add to which Sidekick?');
+      const group = await pickGroup(provider, 'Add to which Thread?');
       if (!group) return;
       const groups = provider.getGroups();
       addEntry(groups, group, { kind: 'file', uri: target.toString() });
@@ -585,7 +585,7 @@ export function activate(context: vscode.ExtensionContext) {
       'editorGroups.importAllOpenEditors',
       async (item?: GroupItem) => {
         const group =
-          item?.name ?? (await pickGroup(provider, 'Import open tabs into which Sidekick?'));
+          item?.name ?? (await pickGroup(provider, 'Import open tabs into which Thread?'));
         if (!group) return;
         const groups = provider.getGroups();
         if (!groups[group]) groups[group] = [];
