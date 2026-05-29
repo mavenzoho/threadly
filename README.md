@@ -1,6 +1,14 @@
-# Threadly
+<p align="center">
+  <img src="icon-large.png" alt="Threadly" width="180" />
+</p>
 
-**Group your AI threads and the files that go with them — right in the VS Code sidebar.**
+<h1 align="center">Threadly</h1>
+
+<p align="center">
+  <strong>Group your AI threads and the files that go with them — right in the VS Code sidebar.</strong>
+</p>
+
+---
 
 If you live in Claude, Copilot, Cursor or Cline chats, you already know the problem: by the end of a project you have 8 chat tabs open, 14 file tabs, and no way to tell which goes with what. Switch tasks and you lose all context.
 
