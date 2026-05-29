@@ -1,0 +1,195 @@
+{
+  "name": "threadly",
+  "displayName": "Threadly — Group AI Chats & Files",
+  "description": "Group your AI chat threads and the files that go with them. Click a saved chat to jump back to that exact Claude session. Works alongside the native Open Editors panel.",
+  "version": "0.1.0",
+  "publisher": "tarekali",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mavenzoho/threadly.git"
+  },
+  "bugs": {
+    "url": "https://github.com/mavenzoho/threadly/issues"
+  },
+  "homepage": "https://github.com/mavenzoho/threadly#readme",
+  "license": "MIT",
+  "keywords": [
+    "ai",
+    "claude",
+    "copilot",
+    "cursor",
+    "tabs",
+    "groups",
+    "workspace",
+    "chat",
+    "sessions",
+    "organize"
+  ],
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "views": {
+      "explorer": [
+        {
+          "id": "threadly",
+          "name": "Threadly",
+          "icon": "$(organization)",
+          "contextualTitle": "Threadly"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "editorGroups.createGroup",
+        "title": "New Thread",
+        "icon": "$(new-folder)"
+      },
+      {
+        "command": "editorGroups.renameGroup",
+        "title": "Rename Thread",
+        "icon": "$(edit)"
+      },
+      {
+        "command": "editorGroups.deleteGroup",
+        "title": "Delete Thread",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "editorGroups.addCurrentFile",
+        "title": "Add Current File to Thread",
+        "icon": "$(add)"
+      },
+      {
+        "command": "editorGroups.addFileToGroup",
+        "title": "Add to Thread..."
+      },
+      {
+        "command": "editorGroups.importAllOpenEditors",
+        "title": "Import All Open Editors into Thread",
+        "icon": "$(cloud-download)"
+      },
+      {
+        "command": "editorGroups.removeFromGroup",
+        "title": "Remove from Thread",
+        "icon": "$(close)"
+      },
+      {
+        "command": "editorGroups.openGroup",
+        "title": "Open All Files in Thread",
+        "icon": "$(folder-opened)"
+      },
+      {
+        "command": "editorGroups.closeGroup",
+        "title": "Close All Files in Thread"
+      },
+      {
+        "command": "editorGroups.refresh",
+        "title": "Refresh",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "editorGroups.debugListTabs",
+        "title": "Thread: Debug — List All Open Tabs"
+      },
+      {
+        "command": "editorGroups.debugSessionLookup",
+        "title": "Thread: Debug — Session ID Lookup"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "editorGroups.createGroup",
+          "when": "view == threadly",
+          "group": "navigation@1"
+        },
+        {
+          "command": "editorGroups.addCurrentFile",
+          "when": "view == threadly",
+          "group": "navigation@2"
+        },
+        {
+          "command": "editorGroups.importAllOpenEditors",
+          "when": "view == threadly",
+          "group": "navigation@3"
+        },
+        {
+          "command": "editorGroups.refresh",
+          "when": "view == threadly",
+          "group": "navigation@4"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "editorGroups.openGroup",
+          "when": "view == threadly && viewItem == group",
+          "group": "inline@1"
+        },
+        {
+          "command": "editorGroups.importAllOpenEditors",
+          "when": "view == threadly && viewItem == group",
+          "group": "inline@2"
+        },
+        {
+          "command": "editorGroups.renameGroup",
+          "when": "view == threadly && viewItem == group",
+          "group": "1_modify@1"
+        },
+        {
+          "command": "editorGroups.deleteGroup",
+          "when": "view == threadly && viewItem == group",
+          "group": "1_modify@2"
+        },
+        {
+          "command": "editorGroups.closeGroup",
+          "when": "view == threadly && viewItem == group",
+          "group": "2_actions@1"
+        },
+        {
+          "command": "editorGroups.removeFromGroup",
+          "when": "view == threadly && viewItem == file",
+          "group": "inline@1"
+        },
+        {
+          "command": "editorGroups.removeFromGroup",
+          "when": "view == threadly && viewItem == chat",
+          "group": "inline@1"
+        }
+      ],
+      "editor/title/context": [
+        {
+          "command": "editorGroups.addFileToGroup",
+          "group": "1_editorGroups"
+        }
+      ],
+      "explorer/context": [
+        {
+          "command": "editorGroups.addFileToGroup",
+          "group": "7_modification",
+          "when": "!explorerResourceIsFolder"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^20.x",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.4.0"
+  },
+  "dependencies": {
+    "sql.js": "^1.14.1"
+  }
+}
