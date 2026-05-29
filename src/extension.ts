@@ -11,6 +11,7 @@ type Entry =
 type GroupsState = Record<string, Entry[]>;
 
 const STATE_KEY = 'editorGroups.groups.v2';
+const ORDER_KEY = 'editorGroups.order.v1';
 const LEGACY_KEY = 'editorGroups.groups';
 
 function extractUri(input: unknown): vscode.Uri | undefined {
@@ -282,6 +283,10 @@ class ChatItem extends vscode.TreeItem {
 
 type Node = GroupItem | FileItem | ChatItem;
 
+type DragPayload =
+  | { kind: 'entry'; entry: Entry; from: string }
+  | { kind: 'group'; name: string };
+
 class EditorGroupsProvider
   implements vscode.TreeDataProvider<Node>, vscode.TreeDragAndDropController<Node>
 {
@@ -315,9 +320,44 @@ class EditorGroupsProvider
     return this.context.workspaceState.get<GroupsState>(STATE_KEY, {});
   }
 
+  getOrder(): string[] {
+    const stored = this.context.workspaceState.get<string[]>(ORDER_KEY, []);
+    const groups = this.getGroups();
+    const keys = new Set(Object.keys(groups));
+    // Keep stored order for known groups, append any new ones at the end
+    const ordered = stored.filter((n) => keys.has(n));
+    for (const k of Object.keys(groups).sort()) {
+      if (!ordered.includes(k)) ordered.push(k);
+    }
+    return ordered;
+  }
+
+  async setOrder(order: string[]): Promise<void> {
+    await this.context.workspaceState.update(ORDER_KEY, order);
+    this.refresh();
+  }
+
   async setGroups(groups: GroupsState): Promise<void> {
     await this.context.workspaceState.update(STATE_KEY, groups);
     this.refresh();
+  }
+
+  async renameGroup(oldName: string, newName: string): Promise<boolean> {
+    if (!newName || newName === oldName) return false;
+    const groups = this.getGroups();
+    if (groups[newName]) return false;
+    // Preserve order by rebuilding both maps in original order
+    const newGroups: GroupsState = {};
+    const order = this.getOrder();
+    for (const n of order) {
+      const target = n === oldName ? newName : n;
+      newGroups[target] = groups[n];
+    }
+    const newOrder = order.map((n) => (n === oldName ? newName : n));
+    await this.context.workspaceState.update(STATE_KEY, newGroups);
+    await this.context.workspaceState.update(ORDER_KEY, newOrder);
+    this.refresh();
+    return true;
   }
 
   getTreeItem(element: Node): vscode.TreeItem {
@@ -327,8 +367,7 @@ class EditorGroupsProvider
   getChildren(element?: Node): Node[] {
     const groups = this.getGroups();
     if (!element) {
-      const names = Object.keys(groups).sort();
-      return names.map((n) => new GroupItem(n, groups[n].length));
+      return this.getOrder().map((n) => new GroupItem(n, groups[n].length));
     }
     if (element instanceof GroupItem) {
       return (groups[element.name] || []).map((e) => {
@@ -340,15 +379,22 @@ class EditorGroupsProvider
   }
 
   async handleDrag(source: Node[], dataTransfer: vscode.DataTransfer): Promise<void> {
-    const payload: { entry: Entry; from: string }[] = [];
+    const payload: DragPayload[] = [];
     for (const s of source) {
       if (s instanceof FileItem) {
-        payload.push({ entry: { kind: 'file', uri: s.uri.toString() }, from: s.groupName });
+        payload.push({
+          kind: 'entry',
+          entry: { kind: 'file', uri: s.uri.toString() },
+          from: s.groupName,
+        });
       } else if (s instanceof ChatItem) {
         payload.push({
+          kind: 'entry',
           entry: { kind: 'chat', label: s.label, viewType: s.viewType, sessionId: s.sessionId },
           from: s.groupName,
         });
+      } else if (s instanceof GroupItem) {
+        payload.push({ kind: 'group', name: s.name });
       }
     }
     if (payload.length === 0) return;
@@ -361,22 +407,44 @@ class EditorGroupsProvider
   async handleDrop(target: Node | undefined, dataTransfer: vscode.DataTransfer): Promise<void> {
     const item = dataTransfer.get('application/vnd.code.tree.threadly');
     if (!item) return;
+    const payload = item.value as DragPayload[];
+    if (!payload?.length) return;
 
-    let targetGroup: string | undefined;
-    if (target instanceof GroupItem) targetGroup = target.name;
-    else if (target instanceof FileItem || target instanceof ChatItem) targetGroup = target.groupName;
-    if (!targetGroup) return;
+    const groupDrags = payload.filter((p): p is Extract<DragPayload, { kind: 'group' }> => p.kind === 'group');
+    const entryDrags = payload.filter((p): p is Extract<DragPayload, { kind: 'entry' }> => p.kind === 'entry');
 
-    const payload = item.value as { entry: Entry; from: string }[];
-    const groups = this.getGroups();
-    for (const { entry, from } of payload) {
-      if (from === targetGroup) continue;
-      const k = entryKey(entry);
-      groups[from] = (groups[from] || []).filter((e) => entryKey(e) !== k);
-      if (!groups[targetGroup]) groups[targetGroup] = [];
-      if (!groups[targetGroup].some((e) => entryKey(e) === k)) groups[targetGroup].push(entry);
+    // Reorder groups: dragging a group onto another group (or before/after)
+    if (groupDrags.length > 0) {
+      let targetName: string | undefined;
+      if (target instanceof GroupItem) targetName = target.name;
+      else if (target instanceof FileItem || target instanceof ChatItem) targetName = target.groupName;
+      // If no target (dropped on empty area), append to end
+      const order = this.getOrder();
+      const movingNames = new Set(groupDrags.map((g) => g.name));
+      const remaining = order.filter((n) => !movingNames.has(n));
+      let insertAt = targetName ? remaining.indexOf(targetName) : remaining.length;
+      if (insertAt < 0) insertAt = remaining.length;
+      const moved = groupDrags.map((g) => g.name).filter((n) => order.includes(n));
+      remaining.splice(insertAt, 0, ...moved);
+      await this.setOrder(remaining);
     }
-    await this.setGroups(groups);
+
+    // Move entries between groups
+    if (entryDrags.length > 0) {
+      let targetGroup: string | undefined;
+      if (target instanceof GroupItem) targetGroup = target.name;
+      else if (target instanceof FileItem || target instanceof ChatItem) targetGroup = target.groupName;
+      if (!targetGroup) return;
+      const groups = this.getGroups();
+      for (const { entry, from } of entryDrags) {
+        if (from === targetGroup) continue;
+        const k = entryKey(entry);
+        groups[from] = (groups[from] || []).filter((e) => entryKey(e) !== k);
+        if (!groups[targetGroup]) groups[targetGroup] = [];
+        if (!groups[targetGroup].some((e) => entryKey(e) === k)) groups[targetGroup].push(entry);
+      }
+      await this.setGroups(groups);
+    }
   }
 }
 
@@ -386,7 +454,7 @@ async function pickGroup(
   allowNew = true,
 ): Promise<string | undefined> {
   const groups = provider.getGroups();
-  const names = Object.keys(groups).sort();
+  const names = provider.getOrder();
   const items: vscode.QuickPickItem[] = names.map((n) => ({
     label: n,
     description: `${groups[n].length} items`,
@@ -512,20 +580,30 @@ export function activate(context: vscode.ExtensionContext) {
       await provider.setGroups(groups);
     }),
 
-    vscode.commands.registerCommand('editorGroups.renameGroup', async (item: GroupItem) => {
-      const newName = await vscode.window.showInputBox({
-        prompt: 'New name',
-        value: item.name,
-      });
-      if (!newName || newName === item.name) return;
-      const groups = provider.getGroups();
-      if (groups[newName]) {
-        vscode.window.showWarningMessage(`Thread "${newName}" already exists.`);
-        return;
+    vscode.commands.registerCommand('editorGroups.renameGroup', async (item?: GroupItem) => {
+      // Fallback: if invoked via keybinding without a tree-item arg, use the selected node
+      let target = item;
+      if (!target) {
+        const sel = treeView.selection.find((n) => n instanceof GroupItem) as GroupItem | undefined;
+        if (!sel) {
+          vscode.window.showInformationMessage('Select a Thread first.');
+          return;
+        }
+        target = sel;
       }
-      groups[newName] = groups[item.name];
-      delete groups[item.name];
-      await provider.setGroups(groups);
+      const newName = await vscode.window.showInputBox({
+        prompt: `Rename "${target.name}"`,
+        value: target.name,
+        valueSelection: [0, target.name.length],
+        validateInput: (v) => {
+          if (!v.trim()) return 'Name cannot be empty';
+          if (v === target!.name) return null;
+          if (provider.getGroups()[v]) return `Thread "${v}" already exists`;
+          return null;
+        },
+      });
+      if (!newName) return;
+      await provider.renameGroup(target.name, newName.trim());
     }),
 
     vscode.commands.registerCommand('editorGroups.deleteGroup', async (item: GroupItem) => {
@@ -537,7 +615,25 @@ export function activate(context: vscode.ExtensionContext) {
       if (confirm !== 'Delete') return;
       const groups = provider.getGroups();
       delete groups[item.name];
+      const order = provider.getOrder().filter((n) => n !== item.name);
+      await context.workspaceState.update(ORDER_KEY, order);
       await provider.setGroups(groups);
+    }),
+
+    vscode.commands.registerCommand('editorGroups.moveGroupUp', async (item: GroupItem) => {
+      const order = provider.getOrder();
+      const i = order.indexOf(item.name);
+      if (i <= 0) return;
+      [order[i - 1], order[i]] = [order[i], order[i - 1]];
+      await provider.setOrder(order);
+    }),
+
+    vscode.commands.registerCommand('editorGroups.moveGroupDown', async (item: GroupItem) => {
+      const order = provider.getOrder();
+      const i = order.indexOf(item.name);
+      if (i < 0 || i >= order.length - 1) return;
+      [order[i + 1], order[i]] = [order[i], order[i + 1]];
+      await provider.setOrder(order);
     }),
 
     vscode.commands.registerCommand('editorGroups.addCurrentFile', async () => {
