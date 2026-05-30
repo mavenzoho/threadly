@@ -14,7 +14,10 @@ type ColorsState = Record<string, string>;
 const STATE_KEY = 'editorGroups.groups.v2';
 const ORDER_KEY = 'editorGroups.order.v1';
 const COLORS_KEY = 'editorGroups.colors.v1';
+const SORT_KEY = 'editorGroups.sortMode.v1';
 const LEGACY_KEY = 'editorGroups.groups';
+
+type SortMode = 'manual' | 'alpha';
 
 const THREAD_COLORS = [
   { name: 'Default', themeColor: undefined as string | undefined },
@@ -355,7 +358,8 @@ async function collectChatHistory(workspacePath: string): Promise<HistoryItem[]>
                   tool,
                   mtimeMs: created || Date.now(),
                   relativeTime: created ? relativeTimeAgo(created) : 'unknown',
-                  uri: tool === 'codex' ? `openai-codex:/${sessionId}` : undefined,
+                  // Use the exact URI Codex itself uses (openai-codex://route/local/<uuid>)
+                  uri: tool === 'codex' ? resource : undefined,
                 });
               }
             } catch {
@@ -540,7 +544,7 @@ async function collectChatHistory(workspacePath: string): Promise<HistoryItem[]>
               tool: 'codex',
               mtimeMs: stat.mtimeMs,
               relativeTime: relativeTimeAgo(stat.mtimeMs),
-              uri: `openai-codex:/${sessionId}`,
+              uri: `openai-codex://route/local/${sessionId}`,
             });
           } catch {
             // skip
@@ -678,14 +682,36 @@ class EditorGroupsProvider
 
   private migrateLegacy() {
     const v2 = this.context.workspaceState.get<GroupsState>(STATE_KEY);
-    if (v2) return;
-    const legacy = this.context.workspaceState.get<Record<string, string[]>>(LEGACY_KEY);
-    if (!legacy) return;
-    const migrated: GroupsState = {};
-    for (const [name, uris] of Object.entries(legacy)) {
-      migrated[name] = uris.map((u) => ({ kind: 'file' as const, uri: u }));
+    if (!v2) {
+      const legacy = this.context.workspaceState.get<Record<string, string[]>>(LEGACY_KEY);
+      if (legacy) {
+        const migrated: GroupsState = {};
+        for (const [name, uris] of Object.entries(legacy)) {
+          migrated[name] = uris.map((u) => ({ kind: 'file' as const, uri: u }));
+        }
+        this.context.workspaceState.update(STATE_KEY, migrated);
+      }
     }
-    this.context.workspaceState.update(STATE_KEY, migrated);
+    // Repair legacy Codex URIs (openai-codex:/<uuid> -> openai-codex://route/local/<uuid>)
+    const current = this.context.workspaceState.get<GroupsState>(STATE_KEY);
+    if (!current) return;
+    let changed = false;
+    for (const list of Object.values(current)) {
+      for (const e of list) {
+        if (
+          e.kind === 'file' &&
+          e.viewType === 'chatgpt.conversationEditor' &&
+          /^openai-codex:\/[0-9a-f-]{36}$/i.test(e.uri)
+        ) {
+          const id = e.uri.split('/').pop();
+          e.uri = `openai-codex://route/local/${id}`;
+          changed = true;
+        }
+      }
+    }
+    if (changed) {
+      this.context.workspaceState.update(STATE_KEY, current);
+    }
   }
 
   refresh(): void {
@@ -696,9 +722,23 @@ class EditorGroupsProvider
     return this.context.workspaceState.get<GroupsState>(STATE_KEY, {});
   }
 
+  getSortMode(): SortMode {
+    return this.context.workspaceState.get<SortMode>(SORT_KEY, 'manual');
+  }
+
+  async setSortMode(mode: SortMode): Promise<void> {
+    await this.context.workspaceState.update(SORT_KEY, mode);
+    this.refresh();
+  }
+
   getOrder(): string[] {
-    const stored = this.context.workspaceState.get<string[]>(ORDER_KEY, []);
     const groups = this.getGroups();
+    if (this.getSortMode() === 'alpha') {
+      return Object.keys(groups).sort((a, b) =>
+        a.localeCompare(b, undefined, { sensitivity: 'base' }),
+      );
+    }
+    const stored = this.context.workspaceState.get<string[]>(ORDER_KEY, []);
     const keys = new Set(Object.keys(groups));
     const ordered = stored.filter((n) => keys.has(n));
     for (const k of Object.keys(groups).sort()) {
@@ -813,7 +853,7 @@ class EditorGroupsProvider
     const entryDrags = payload.filter((p): p is Extract<DragPayload, { kind: 'entry' }> => p.kind === 'entry');
 
     // Reorder groups: dragging a group onto another group (or before/after)
-    if (groupDrags.length > 0) {
+    if (groupDrags.length > 0 && this.getSortMode() === 'manual') {
       let targetName: string | undefined;
       if (target instanceof GroupItem) targetName = target.name;
       else if (target instanceof FileItem || target instanceof ChatItem) targetName = target.groupName;
@@ -881,6 +921,19 @@ function addEntry(groups: GroupsState, groupName: string, entry: Entry): boolean
   if (groups[groupName].some((e) => entryKey(e) === k)) return false;
   groups[groupName].push(entry);
   return true;
+}
+
+function isEntryInAnyGroup(groups: GroupsState, entry: Entry): boolean {
+  const k = entryKey(entry);
+  for (const list of Object.values(groups)) {
+    if (list.some((e) => entryKey(e) === k)) return true;
+  }
+  return false;
+}
+
+function addEntryUnique(groups: GroupsState, groupName: string, entry: Entry): boolean {
+  if (isEntryInAnyGroup(groups, entry)) return false;
+  return addEntry(groups, groupName, entry);
 }
 
 export function activate(context: vscode.ExtensionContext) {
@@ -1019,7 +1072,32 @@ export function activate(context: vscode.ExtensionContext) {
       await provider.setGroups(groups);
     }),
 
+    vscode.commands.registerCommand('editorGroups.setSortMode', async () => {
+      const current = provider.getSortMode();
+      const picked = await vscode.window.showQuickPick(
+        [
+          {
+            label: `$(list-ordered) Manual${current === 'manual' ? ' (current)' : ''}`,
+            description: 'Drag, or use Move Up / Move Down',
+            mode: 'manual' as SortMode,
+          },
+          {
+            label: `$(sort-precedence) Alphabetical${current === 'alpha' ? ' (current)' : ''}`,
+            description: 'Sort Threads by name',
+            mode: 'alpha' as SortMode,
+          },
+        ],
+        { placeHolder: 'How should Threads be sorted?' },
+      );
+      if (!picked) return;
+      await provider.setSortMode(picked.mode);
+    }),
+
     vscode.commands.registerCommand('editorGroups.moveGroupUp', async (item: GroupItem) => {
+      if (provider.getSortMode() === 'alpha') {
+        vscode.window.showInformationMessage('Switch to Manual sort to reorder Threads.');
+        return;
+      }
       const order = provider.getOrder();
       const i = order.indexOf(item.name);
       if (i <= 0) return;
@@ -1028,6 +1106,10 @@ export function activate(context: vscode.ExtensionContext) {
     }),
 
     vscode.commands.registerCommand('editorGroups.moveGroupDown', async (item: GroupItem) => {
+      if (provider.getSortMode() === 'alpha') {
+        vscode.window.showInformationMessage('Switch to Manual sort to reorder Threads.');
+        return;
+      }
       const order = provider.getOrder();
       const i = order.indexOf(item.name);
       if (i < 0 || i >= order.length - 1) return;
@@ -1178,6 +1260,16 @@ export function activate(context: vscode.ExtensionContext) {
         );
         return;
       }
+      const groupsCheck = provider.getGroups();
+      if (isEntryInAnyGroup(groupsCheck, entry)) {
+        const existingThread = Object.entries(groupsCheck).find(([, list]) =>
+          list.some((e) => entryKey(e) === entryKey(entry!)),
+        )?.[0];
+        vscode.window.showInformationMessage(
+          `Already in Thread "${existingThread}". Move it instead?`,
+        );
+        return;
+      }
       const group = await pickGroup(provider, 'Add to which Thread?');
       if (!group) return;
       const groups = provider.getGroups();
@@ -1188,10 +1280,19 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand('editorGroups.addFileToGroup', async (uri?: vscode.Uri) => {
       const target = uri ?? vscode.window.activeTextEditor?.document.uri;
       if (!target) return;
+      const entry: Entry = { kind: 'file', uri: target.toString() };
+      const groupsCheck = provider.getGroups();
+      if (isEntryInAnyGroup(groupsCheck, entry)) {
+        const existingThread = Object.entries(groupsCheck).find(([, list]) =>
+          list.some((e) => entryKey(e) === entryKey(entry)),
+        )?.[0];
+        vscode.window.showInformationMessage(`Already in Thread "${existingThread}".`);
+        return;
+      }
       const group = await pickGroup(provider, 'Add to which Thread?');
       if (!group) return;
       const groups = provider.getGroups();
-      addEntry(groups, group, { kind: 'file', uri: target.toString() });
+      addEntry(groups, group, entry);
       await provider.setGroups(groups);
     }),
 
@@ -1206,7 +1307,8 @@ export function activate(context: vscode.ExtensionContext) {
 
         let addedFiles = 0;
         let addedChats = 0;
-        let skipped = 0;
+        let skippedUnsupported = 0;
+        let skippedAlreadyInThread = 0;
         const titleMap = await loadChatSessionMap();
 
         for (const tabGroup of vscode.window.tabGroups.all) {
@@ -1215,14 +1317,15 @@ export function activate(context: vscode.ExtensionContext) {
             if (uri) {
               const vt = extractViewType(tab.input);
               const isAI = isAICustomEditor(tab.input);
-              if (
-                addEntry(groups, group, {
-                  kind: 'file',
-                  uri: uri.toString(),
-                  viewType: isAI ? vt : undefined,
-                  label: isAI ? tab.label : undefined,
-                })
-              ) {
+              const entry: Entry = {
+                kind: 'file',
+                uri: uri.toString(),
+                viewType: isAI ? vt : undefined,
+                label: isAI ? tab.label : undefined,
+              };
+              if (isEntryInAnyGroup(groups, entry)) {
+                skippedAlreadyInThread++;
+              } else if (addEntry(groups, group, entry)) {
                 if (isAI) addedChats++;
                 else addedFiles++;
               }
@@ -1231,18 +1334,20 @@ export function activate(context: vscode.ExtensionContext) {
             if (isChatWebview(tab.input)) {
               const vt = (tab.input as vscode.TabInputWebview).viewType;
               const sessionId = fuzzyMatchTitle(tab.label, titleMap);
-              if (
-                addEntry(groups, group, {
-                  kind: 'chat',
-                  label: tab.label,
-                  viewType: vt,
-                  sessionId,
-                })
-              )
+              const entry: Entry = {
+                kind: 'chat',
+                label: tab.label,
+                viewType: vt,
+                sessionId,
+              };
+              if (isEntryInAnyGroup(groups, entry)) {
+                skippedAlreadyInThread++;
+              } else if (addEntry(groups, group, entry)) {
                 addedChats++;
+              }
               continue;
             }
-            skipped++;
+            skippedUnsupported++;
           }
         }
         await provider.setGroups(groups);
@@ -1252,8 +1357,13 @@ export function activate(context: vscode.ExtensionContext) {
         if (addedChats) parts.push(`${addedChats} chat${addedChats === 1 ? '' : 's'}`);
         const headline = parts.length
           ? `Added ${parts.join(' + ')} to "${group}".`
-          : `Nothing added to "${group}".`;
-        const tail = skipped > 0 ? ` Skipped ${skipped} unsupported tab${skipped === 1 ? '' : 's'}.` : '';
+          : `Nothing new added to "${group}".`;
+        const tailParts: string[] = [];
+        if (skippedAlreadyInThread > 0)
+          tailParts.push(`${skippedAlreadyInThread} already in another Thread`);
+        if (skippedUnsupported > 0)
+          tailParts.push(`${skippedUnsupported} unsupported`);
+        const tail = tailParts.length ? ` Skipped: ${tailParts.join(', ')}.` : '';
         vscode.window.showInformationMessage(headline + tail);
       },
     ),
