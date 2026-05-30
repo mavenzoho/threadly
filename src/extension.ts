@@ -396,9 +396,52 @@ async function collectChatHistory(workspacePath: string): Promise<HistoryItem[]>
           try {
             const stat = fs.statSync(fp);
             seenIds.add(sessionId);
+
+            // Best-effort title: walk lines of the jsonl looking for the first
+            // user *text* message. Skip image/system/command/tool wrappers.
+            let title = `${sessionId.slice(0, 8)} (untitled)`;
+            try {
+              const text = fs.readFileSync(fp, 'utf8');
+              const lines = text.split('\n');
+              for (const line of lines) {
+                if (!line) continue;
+                // Cheap pre-filter: must mention text content
+                if (!line.includes('"type":"text"')) continue;
+                // Skip massive image-bearing lines for speed
+                if (line.length > 200000) continue;
+
+                let row: any;
+                try {
+                  row = JSON.parse(line);
+                } catch {
+                  continue;
+                }
+                // Walk into row.message.content[] looking for a text item
+                const content = row?.message?.content;
+                if (!Array.isArray(content)) continue;
+                let chosen: string | undefined;
+                for (const c of content) {
+                  if (c?.type === 'text' && typeof c.text === 'string') {
+                    chosen = c.text;
+                    break;
+                  }
+                }
+                if (!chosen) continue;
+                const trimmed = chosen.replace(/\s+/g, ' ').trim();
+                if (!trimmed) continue;
+                if (/^(<command-name|<system-reminder|<bash-stdout|<local-command|Caveat:|\[Image|Base directory for this skill|This skill guides|<ide_selection|<system>)/i.test(trimmed)) continue;
+                // Only count user-side messages as a real title source
+                if (row?.message?.role && row.message.role !== 'user' && row?.type !== 'user') continue;
+                title = trimmed.slice(0, 80);
+                break;
+              }
+            } catch {
+              // skip — keep the untitled placeholder
+            }
+
             items.push({
               sessionId,
-              title: `${sessionId.slice(0, 8)} (untitled)`,
+              title,
               tool: 'claude',
               mtimeMs: stat.mtimeMs,
               relativeTime: relativeTimeAgo(stat.mtimeMs),
