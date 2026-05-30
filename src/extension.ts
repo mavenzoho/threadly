@@ -264,13 +264,14 @@ function relativeTimeAgo(ms: number): string {
 }
 
 function claudeProjectDirName(workspacePath: string): string {
-  // Claude uses a slug derived from the absolute path: D:\New folder (2) -> d--New-folder--2-
-  // Replace non-alphanumerics with `-`, lowercase the drive letter prefix.
-  return workspacePath
-    .replace(/[\\/:]/g, '-')
-    .replace(/[^a-zA-Z0-9-]/g, '-')
-    .replace(/-+/g, '-')
-    .toLowerCase();
+  // Claude's actual scheme: replace EACH non-alphanumeric char with a single `-`, do NOT collapse,
+  // preserve original case. Drive letter gets lowercased but only via the leading char rule.
+  // Examples observed on disk:
+  //   "d:\erpnbox"         -> "d--erpnbox"          (drive letter is already lowercase here)
+  //   "D:\New folder (2)"  -> "d--New-folder--2-"   (D->d, rest preserved)
+  const replaced = workspacePath.replace(/[^a-zA-Z0-9]/g, '-');
+  // Lowercase only the first alphabetic char (drive letter), keep rest as-is
+  return replaced.length > 0 ? replaced[0].toLowerCase() + replaced.slice(1) : '';
 }
 
 async function collectChatHistory(workspacePath: string): Promise<HistoryItem[]> {
@@ -282,10 +283,18 @@ async function collectChatHistory(workspacePath: string): Promise<HistoryItem[]>
     if (fs.existsSync(claudeRoot)) {
       const wantedSlug = claudeProjectDirName(workspacePath);
       let projectDir: string | undefined;
-      for (const entry of fs.readdirSync(claudeRoot)) {
-        if (entry.toLowerCase() === wantedSlug || entry.toLowerCase().includes(wantedSlug)) {
-          projectDir = path.join(claudeRoot, entry);
-          break;
+      // Exact match first
+      const exactPath = path.join(claudeRoot, wantedSlug);
+      if (fs.existsSync(exactPath)) {
+        projectDir = exactPath;
+      } else {
+        // Case-insensitive fallback
+        const wantedLower = wantedSlug.toLowerCase();
+        for (const entry of fs.readdirSync(claudeRoot)) {
+          if (entry.toLowerCase() === wantedLower) {
+            projectDir = path.join(claudeRoot, entry);
+            break;
+          }
         }
       }
       if (projectDir && fs.existsSync(projectDir)) {
@@ -332,17 +341,15 @@ async function collectChatHistory(workspacePath: string): Promise<HistoryItem[]>
     // skip
   }
 
-  // 2) Codex sessions: stored under ~/.codex/sessions or similar. We'll do best-effort.
+  // 2) Codex sessions: ~/.codex/sessions/<year>/<month>/<day>/rollout-<ts>-<uuid>.jsonl
+  // Each file's first line is a session_meta object with id + cwd + timestamp.
   try {
-    const codexCandidates = [
-      path.join(os.homedir(), '.codex'),
-      path.join(os.homedir(), '.openai-codex'),
-      process.env.APPDATA && path.join(process.env.APPDATA, 'Codex'),
-    ].filter(Boolean) as string[];
-    for (const root of codexCandidates) {
-      if (!fs.existsSync(root)) continue;
+    const codexSessionsRoot = path.join(os.homedir(), '.codex', 'sessions');
+    if (fs.existsSync(codexSessionsRoot)) {
+      const normalize = (p: string) => p.replace(/\\/g, '/').toLowerCase();
+      const wantedCwd = normalize(workspacePath);
       const walk = (dir: string, depth: number) => {
-        if (depth > 4) return;
+        if (depth > 5) return;
         let entries: fs.Dirent[] = [];
         try {
           entries = fs.readdirSync(dir, { withFileTypes: true });
@@ -353,37 +360,77 @@ async function collectChatHistory(workspacePath: string): Promise<HistoryItem[]>
           const p = path.join(dir, e.name);
           if (e.isDirectory()) {
             walk(p, depth + 1);
-          } else if (/\.(json|jsonl)$/.test(e.name) && /thread|session|conversation/i.test(p)) {
+            continue;
+          }
+          if (!(e.name.startsWith('rollout-') && e.name.endsWith('.jsonl'))) continue;
+          try {
+            const stat = fs.statSync(p);
+            const buf = Buffer.alloc(Math.min(stat.size, 4096));
+            const fd = fs.openSync(p, 'r');
             try {
-              const stat = fs.statSync(p);
-              const text = fs.readFileSync(p, 'utf8').slice(0, 4000);
-              const idMatch = text.match(/"(?:threadId|sessionId|conversationId|id)"\s*:\s*"([0-9a-f-]{12,})"/i);
-              const titleMatch = text.match(/"(?:title|name|summary)"\s*:\s*"((?:[^"\\]|\\.){3,120})"/);
-              if (idMatch) {
-                let title = idMatch[1].slice(0, 8);
-                if (titleMatch) {
-                  try {
-                    title = JSON.parse('"' + titleMatch[1] + '"').trim().slice(0, 80);
-                  } catch {
-                    // skip
-                  }
-                }
-                items.push({
-                  sessionId: idMatch[1],
-                  title,
-                  tool: 'codex',
-                  mtimeMs: stat.mtimeMs,
-                  relativeTime: relativeTimeAgo(stat.mtimeMs),
-                  uri: `openai-codex:/${idMatch[1]}`,
-                });
-              }
-            } catch {
-              // skip
+              fs.readSync(fd, buf, 0, buf.length, 0);
+            } finally {
+              fs.closeSync(fd);
             }
+            const firstLine = buf.toString('utf8').split('\n')[0];
+            let meta: any;
+            try {
+              meta = JSON.parse(firstLine);
+            } catch {
+              continue;
+            }
+            if (meta?.type !== 'session_meta' || !meta?.payload) continue;
+            const payload = meta.payload;
+            const sessionId = payload.id;
+            if (typeof sessionId !== 'string') continue;
+
+            // Filter by workspace: keep only sessions whose cwd matches the current folder
+            const cwd = typeof payload.cwd === 'string' ? normalize(payload.cwd) : '';
+            if (cwd && cwd !== wantedCwd && !cwd.startsWith(wantedCwd) && !wantedCwd.startsWith(cwd)) {
+              continue;
+            }
+
+              // Title: try a few places. Best effort.
+              let title = sessionId.slice(0, 8);
+              if (typeof payload.title === 'string' && payload.title.trim()) {
+                title = payload.title.trim().slice(0, 80);
+              } else {
+                // Codex stores user messages as JSON objects with role:user and content[].text/input_text.
+                // The first few user messages are framework boilerplate (environment_context, app-context,
+                // permissions instructions). Skip those and grab the first real user prompt.
+                const text = fs.readFileSync(p, 'utf8').slice(0, 60000);
+                const userRegex = /"role"\s*:\s*"user"[\s\S]{0,2000}?"(?:text|input_text)"\s*:\s*"((?:[^"\\]|\\.){2,400})"/g;
+                let m: RegExpExecArray | null;
+                while ((m = userRegex.exec(text)) !== null) {
+                  let candidate = '';
+                  try {
+                    candidate = JSON.parse('"' + m[1] + '"');
+                  } catch {
+                    continue;
+                  }
+                  const trimmed = candidate.trim();
+                  if (!trimmed) continue;
+                  if (/^<(environment_context|app-context|permissions|user-instructions)/i.test(trimmed)) continue;
+                  if (trimmed.startsWith('<') && trimmed.endsWith('>')) continue;
+                  title = trimmed.replace(/\s+/g, ' ').slice(0, 80);
+                  break;
+                }
+              }
+
+            items.push({
+              sessionId,
+              title,
+              tool: 'codex',
+              mtimeMs: stat.mtimeMs,
+              relativeTime: relativeTimeAgo(stat.mtimeMs),
+              uri: `openai-codex:/${sessionId}`,
+            });
+          } catch {
+            // skip
           }
         }
       };
-      walk(root, 0);
+      walk(codexSessionsRoot, 0);
     }
   } catch {
     // skip
