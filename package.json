@@ -2,7 +2,7 @@
   "name": "threadly",
   "displayName": "Threadly — Group AI Chats & Files",
   "description": "Group your AI chat threads and the files that go with them. Click a saved chat to jump back to that exact Claude session. Works alongside the native Open Editors panel.",
-  "version": "0.3.3",
+  "version": "0.3.4",
   "publisher": "tarekali",
   "repository": {
     "type": "git",
@@ -172,6 +172,11 @@
           "group": "inline@2"
         },
         {
+          "command": "editorGroups.browseChatHistory",
+          "when": "view == threadly && viewItem == group",
+          "group": "inline@3"
+        },
+        {
           "command": "editorGroups.renameGroup",
           "when": "view == threadly && viewItem == group",
           "group": "1_modify@1"
@@ -195,6 +200,11 @@
           "command": "editorGroups.setColor",
           "when": "view == threadly && viewItem == group",
           "group": "1_modify@5"
+        },
+        {
+          "command": "editorGroups.browseChatHistory",
+          "when": "view == threadly && viewItem == group",
+          "group": "2_actions@2"
         },
         {
           "command": "editorGroups.closeGroup",

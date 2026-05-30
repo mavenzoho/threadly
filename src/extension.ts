@@ -1016,12 +1016,15 @@ export function activate(context: vscode.ExtensionContext) {
       await provider.setColor(target.name, picked.themeColor);
     }),
 
-    vscode.commands.registerCommand('editorGroups.browseChatHistory', async () => {
+    vscode.commands.registerCommand(
+      'editorGroups.browseChatHistory',
+      async (item?: GroupItem) => {
       const wsFolder = vscode.workspace.workspaceFolders?.[0];
       if (!wsFolder) {
         vscode.window.showInformationMessage('No workspace folder open.');
         return;
       }
+      const presetGroup = item instanceof GroupItem ? item.name : undefined;
       const items = await collectChatHistory(wsFolder.uri.fsPath);
       if (items.length === 0) {
         vscode.window.showInformationMessage(
@@ -1055,6 +1058,7 @@ export function activate(context: vscode.ExtensionContext) {
         return;
       }
 
+      const destLabel = presetGroup ? `"${presetGroup}"` : 'a Thread';
       const picked = await vscode.window.showQuickPick(
         fresh.map((it) => ({
           label: `$(${it.tool === 'codex' ? 'rocket' : 'comment-discussion'}) ${it.title}`,
@@ -1065,15 +1069,15 @@ export function activate(context: vscode.ExtensionContext) {
         {
           placeHolder:
             skippedCount > 0
-              ? `${fresh.length} new chats (${skippedCount} already in Threads) — pick one or many`
-              : `Found ${fresh.length} past chats — pick one (or many) to add to a Thread`,
+              ? `${fresh.length} new chats (${skippedCount} already in Threads) — pick to add to ${destLabel}`
+              : `Found ${fresh.length} past chats — pick to add to ${destLabel}`,
           canPickMany: true,
           matchOnDescription: true,
           matchOnDetail: true,
         },
       );
       if (!picked || picked.length === 0) return;
-      const group = await pickGroup(provider, 'Add selected chats to which Thread?');
+      const group = presetGroup ?? (await pickGroup(provider, 'Add selected chats to which Thread?'));
       if (!group) return;
       const groups = provider.getGroups();
       let added = 0;
