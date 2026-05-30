@@ -276,19 +276,109 @@ function claudeProjectDirName(workspacePath: string): string {
 
 async function collectChatHistory(workspacePath: string): Promise<HistoryItem[]> {
   const items: HistoryItem[] = [];
+  const seenIds = new Set<string>();
 
-  // 1) Claude sessions: ~/.claude/projects/<slug>/*.jsonl
+  // PRIMARY source: VS Code's `agentSessions.model.cache` in state.vscdb.
+  // This holds the exact list Claude/Codex show in their sidebars — sessionId, label, providerType, timing.
+  try {
+    const userDir = getCodeUserDir();
+    if (userDir) {
+      const storageRoot = path.join(userDir, 'workspaceStorage');
+      if (fs.existsSync(storageRoot)) {
+        const normalize = (p: string) =>
+          decodeURIComponent(p).replace(/^file:\/\/\//, '').replace(/\\/g, '/').replace(/^\/+/, '').toLowerCase();
+        const wantedNorm = normalize(workspacePath);
+
+        // Find all workspaceStorage dirs whose workspace.json points to (or contains) the current folder.
+        const matchingDirs: string[] = [];
+        for (const entry of fs.readdirSync(storageRoot)) {
+          const wj = path.join(storageRoot, entry, 'workspace.json');
+          if (!fs.existsSync(wj)) continue;
+          try {
+            const data = JSON.parse(fs.readFileSync(wj, 'utf8'));
+            const stored = (data.folder || data.workspace || '') as string;
+            const storedNorm = normalize(stored);
+            if (
+              storedNorm === wantedNorm ||
+              storedNorm.startsWith(wantedNorm + '/') ||
+              wantedNorm.startsWith(storedNorm + '/') ||
+              storedNorm.includes(wantedNorm) ||
+              wantedNorm.includes(storedNorm.replace(/\.code-workspace$/, ''))
+            ) {
+              matchingDirs.push(path.join(storageRoot, entry));
+            }
+          } catch {
+            // skip
+          }
+        }
+
+        if (matchingDirs.length > 0) {
+          // eslint-disable-next-line @typescript-eslint/no-var-requires
+          const initSqlJs = require('sql.js');
+          const sqlJsMain = require.resolve('sql.js');
+          let wasmPath = path.join(path.dirname(sqlJsMain), 'sql-wasm.wasm');
+          if (!fs.existsSync(wasmPath)) {
+            const pkgRoot = path.resolve(path.dirname(sqlJsMain), '..');
+            wasmPath = path.join(pkgRoot, 'dist', 'sql-wasm.wasm');
+          }
+          const SQL = await initSqlJs({ locateFile: () => wasmPath });
+
+          for (const wsDir of matchingDirs) {
+            const dbPath = path.join(wsDir, 'state.vscdb');
+            if (!fs.existsSync(dbPath)) continue;
+            try {
+              const buf = fs.readFileSync(dbPath);
+              const db = new SQL.Database(buf);
+              const res = db.exec(
+                "SELECT value FROM ItemTable WHERE key = 'agentSessions.model.cache'",
+              );
+              const raw = res?.[0]?.values?.[0]?.[0];
+              db.close();
+              if (typeof raw !== 'string') continue;
+              const arr = JSON.parse(raw);
+              if (!Array.isArray(arr)) continue;
+              for (const a of arr) {
+                const resource = String(a?.resource || '');
+                // claude-code:/<uuid>  or  openai-codex://route/local/<uuid>
+                const idMatch = resource.match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
+                if (!idMatch) continue;
+                const sessionId = idMatch[1];
+                if (seenIds.has(sessionId)) continue;
+                seenIds.add(sessionId);
+                const provider = String(a?.providerType || '');
+                const tool: 'claude' | 'codex' = provider.includes('codex') ? 'codex' : 'claude';
+                const title = String(a?.label || '').trim() || sessionId.slice(0, 8);
+                const created = Number(a?.timing?.lastRequestEnded || a?.timing?.lastRequestStarted || a?.timing?.created || 0);
+                items.push({
+                  sessionId,
+                  title: title.slice(0, 100),
+                  tool,
+                  mtimeMs: created || Date.now(),
+                  relativeTime: created ? relativeTimeAgo(created) : 'unknown',
+                  uri: tool === 'codex' ? `openai-codex:/${sessionId}` : undefined,
+                });
+              }
+            } catch {
+              // skip
+            }
+          }
+        }
+      }
+    }
+  } catch {
+    // skip
+  }
+
+  // FALLBACK 1: Scan ~/.claude/projects/<slug>/*.jsonl for sessions VS Code's cache forgot about.
   try {
     const claudeRoot = path.join(os.homedir(), '.claude', 'projects');
     if (fs.existsSync(claudeRoot)) {
       const wantedSlug = claudeProjectDirName(workspacePath);
       let projectDir: string | undefined;
-      // Exact match first
       const exactPath = path.join(claudeRoot, wantedSlug);
       if (fs.existsSync(exactPath)) {
         projectDir = exactPath;
       } else {
-        // Case-insensitive fallback
         const wantedLower = wantedSlug.toLowerCase();
         for (const entry of fs.readdirSync(claudeRoot)) {
           if (entry.toLowerCase() === wantedLower) {
@@ -301,32 +391,14 @@ async function collectChatHistory(workspacePath: string): Promise<HistoryItem[]>
         for (const f of fs.readdirSync(projectDir)) {
           if (!f.endsWith('.jsonl')) continue;
           const sessionId = f.slice(0, -6);
+          if (seenIds.has(sessionId)) continue;
           const fp = path.join(projectDir, f);
           try {
             const stat = fs.statSync(fp);
-            // Grab first user message text or first ~120 chars for title
-            let title = sessionId.slice(0, 8);
-            const text = fs.readFileSync(fp, 'utf8').slice(0, 8000);
-            const m = text.match(/"role"\s*:\s*"user"[\s\S]{0,500}?"content"\s*:\s*"((?:[^"\\]|\\.){5,200})"/);
-            if (m) {
-              try {
-                title = JSON.parse('"' + m[1] + '"').replace(/\s+/g, ' ').trim().slice(0, 80);
-              } catch {
-                // ignore
-              }
-            } else {
-              const tm = text.match(/"content"\s*:\s*\[\s*\{\s*"type"\s*:\s*"text"\s*,\s*"text"\s*:\s*"((?:[^"\\]|\\.){5,200})"/);
-              if (tm) {
-                try {
-                  title = JSON.parse('"' + tm[1] + '"').replace(/\s+/g, ' ').trim().slice(0, 80);
-                } catch {
-                  // ignore
-                }
-              }
-            }
+            seenIds.add(sessionId);
             items.push({
               sessionId,
-              title,
+              title: `${sessionId.slice(0, 8)} (untitled)`,
               tool: 'claude',
               mtimeMs: stat.mtimeMs,
               relativeTime: relativeTimeAgo(stat.mtimeMs),
@@ -383,12 +455,14 @@ async function collectChatHistory(workspacePath: string): Promise<HistoryItem[]>
             const payload = meta.payload;
             const sessionId = payload.id;
             if (typeof sessionId !== 'string') continue;
+            if (seenIds.has(sessionId)) continue;
 
             // Filter by workspace: keep only sessions whose cwd matches the current folder
             const cwd = typeof payload.cwd === 'string' ? normalize(payload.cwd) : '';
             if (cwd && cwd !== wantedCwd && !cwd.startsWith(wantedCwd) && !wantedCwd.startsWith(cwd)) {
               continue;
             }
+            seenIds.add(sessionId);
 
               // Title: try a few places. Best effort.
               let title = sessionId.slice(0, 8);
@@ -951,19 +1025,48 @@ export function activate(context: vscode.ExtensionContext) {
       const items = await collectChatHistory(wsFolder.uri.fsPath);
       if (items.length === 0) {
         vscode.window.showInformationMessage(
-          'No past chats found for this workspace. (Looked in ~/.claude/projects)',
+          'No past chats found for this workspace.',
         );
         return;
       }
+
+      // Filter out chats already saved in any Thread
+      const existingSessionIds = new Set<string>();
+      const existingUris = new Set<string>();
+      const allGroups = provider.getGroups();
+      for (const entries of Object.values(allGroups)) {
+        for (const e of entries) {
+          if (e.kind === 'chat' && e.sessionId) existingSessionIds.add(e.sessionId);
+          if (e.kind === 'file') existingUris.add(e.uri);
+        }
+      }
+
+      const fresh = items.filter((it) => {
+        if (existingSessionIds.has(it.sessionId)) return false;
+        if (it.uri && existingUris.has(it.uri)) return false;
+        return true;
+      });
+      const skippedCount = items.length - fresh.length;
+
+      if (fresh.length === 0) {
+        vscode.window.showInformationMessage(
+          `All ${items.length} past chats are already in your Threads. Nothing new to add.`,
+        );
+        return;
+      }
+
       const picked = await vscode.window.showQuickPick(
-        items.map((it) => ({
+        fresh.map((it) => ({
           label: `$(${it.tool === 'codex' ? 'rocket' : 'comment-discussion'}) ${it.title}`,
           description: `${it.tool} · ${it.relativeTime}`,
           detail: it.sessionId.slice(0, 8),
           payload: it,
         })),
         {
-          placeHolder: `Found ${items.length} past chats — pick one (or many) to add to a Thread`,
+          placeHolder:
+            skippedCount > 0
+              ? `${fresh.length} new chats (${skippedCount} already in Threads) — pick one or many`
+              : `Found ${fresh.length} past chats — pick one (or many) to add to a Thread`,
           canPickMany: true,
           matchOnDescription: true,
           matchOnDetail: true,
