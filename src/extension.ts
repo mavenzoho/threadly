@@ -615,7 +615,8 @@ class FileItem extends vscode.TreeItem {
 
     if (isAIScheme) {
       this.contextValue = 'chat';
-      this.iconPath = new vscode.ThemeIcon('comment-discussion');
+      // Codex = rocket icon, tinted green (OpenAI brand)
+      this.iconPath = new vscode.ThemeIcon('rocket', new vscode.ThemeColor('charts.green'));
       this.description = 'Codex';
       this.tooltip = `Codex chat\n${uri.toString()}`;
     } else {
@@ -648,11 +649,27 @@ class ChatItem extends vscode.TreeItem {
   ) {
     super(label, vscode.TreeItemCollapsibleState.None);
     this.contextValue = 'chat';
-    this.iconPath = new vscode.ThemeIcon('comment-discussion');
-    this.description = sessionId ? '' : 'chat (no id)';
+
+    // Provider-specific icon + tint.
+    const vt = (viewType || '').toLowerCase();
+    if (vt.includes('claude')) {
+      // Claude = comment icon, tinted Anthropic-orange
+      this.iconPath = new vscode.ThemeIcon(
+        'comment-discussion',
+        new vscode.ThemeColor('charts.orange'),
+      );
+      this.description = sessionId ? 'Claude' : 'Claude (no id)';
+    } else if (vt.includes('copilot')) {
+      this.iconPath = new vscode.ThemeIcon('copilot', new vscode.ThemeColor('charts.blue'));
+      this.description = sessionId ? 'Copilot' : 'Copilot (no id)';
+    } else {
+      this.iconPath = new vscode.ThemeIcon('comment-discussion');
+      this.description = sessionId ? 'chat' : 'chat (no id)';
+    }
+
     this.tooltip = sessionId
-      ? `Chat: ${label}\nsessionId: ${sessionId}\nClick to reopen this exact chat.`
-      : `Chat: ${label}\nNo session id captured — click opens the Claude panel.`;
+      ? `${this.description}: ${label}\nsessionId: ${sessionId}\nClick to reopen this exact chat.`
+      : `${this.description}: ${label}\nNo session id captured — click opens the chat panel.`;
     this.command = {
       command: 'editorGroups.openChat',
       title: 'Open Chat',
