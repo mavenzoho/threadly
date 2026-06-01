@@ -615,8 +615,7 @@ class FileItem extends vscode.TreeItem {
 
     if (isAIScheme) {
       this.contextValue = 'chat';
-      // Codex = rocket icon, tinted green (OpenAI brand)
-      this.iconPath = new vscode.ThemeIcon('rocket', new vscode.ThemeColor('charts.green'));
+      this.iconPath = new vscode.ThemeIcon('rocket');
       this.description = 'Codex';
       this.tooltip = `Codex chat\n${uri.toString()}`;
     } else {
@@ -650,20 +649,15 @@ class ChatItem extends vscode.TreeItem {
     super(label, vscode.TreeItemCollapsibleState.None);
     this.contextValue = 'chat';
 
-    // Provider-specific icon + tint.
     const vt = (viewType || '').toLowerCase();
     if (vt.includes('claude')) {
-      // Claude = comment icon, tinted Anthropic-orange
-      this.iconPath = new vscode.ThemeIcon(
-        'comment-discussion',
-        new vscode.ThemeColor('charts.orange'),
-      );
+      this.iconPath = new vscode.ThemeIcon('comment-discussion');
       this.description = sessionId ? 'Claude' : 'Claude (no id)';
     } else if (vt.includes('copilot')) {
-      this.iconPath = new vscode.ThemeIcon('copilot', new vscode.ThemeColor('charts.blue'));
+      this.iconPath = new vscode.ThemeIcon('copilot');
       this.description = sessionId ? 'Copilot' : 'Copilot (no id)';
     } else {
-      this.iconPath = new vscode.ThemeIcon('comment-discussion');
+      this.iconPath = new vscode.ThemeIcon('comment');
       this.description = sessionId ? 'chat' : 'chat (no id)';
     }
 
