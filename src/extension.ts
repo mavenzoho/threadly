@@ -1197,8 +1197,8 @@ export function activate(context: vscode.ExtensionContext) {
       const destLabel = presetGroup ? `"${presetGroup}"` : 'a Thread';
       const picked = await vscode.window.showQuickPick(
         fresh.map((it) => ({
-          label: `$(${it.tool === 'codex' ? 'rocket' : 'comment-discussion'}) ${it.title}`,
-          description: `${it.tool} · ${it.relativeTime}`,
+          label: it.title,
+          description: `${it.tool === 'codex' ? '🚀' : '💬'} ${it.tool} · ${it.relativeTime}`,
           detail: it.sessionId.slice(0, 8),
           payload: it,
         })),
