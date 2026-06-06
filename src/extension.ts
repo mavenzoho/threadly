@@ -281,6 +281,19 @@ async function collectChatHistory(workspacePath: string): Promise<HistoryItem[]>
   const items: HistoryItem[] = [];
   const seenIds = new Set<string>();
 
+  // PRE-PASS: pull live tab titles (the ones you see in the tab bar) from
+  // memento/workbench.parts.editor. These are the real, current titles —
+  // agentSessions.model.cache lags or stores generic labels.
+  const liveTitleById = new Map<string, string>();
+  try {
+    const byTitle = await loadChatSessionMap();
+    for (const [title, sessionId] of byTitle) {
+      if (!liveTitleById.has(sessionId)) liveTitleById.set(sessionId, title);
+    }
+  } catch {
+    // skip — fall through to the other sources
+  }
+
   // PRIMARY source: VS Code's `agentSessions.model.cache` in state.vscdb.
   // This holds the exact list Claude/Codex show in their sidebars — sessionId, label, providerType, timing.
   try {
@@ -350,7 +363,9 @@ async function collectChatHistory(workspacePath: string): Promise<HistoryItem[]>
                 seenIds.add(sessionId);
                 const provider = String(a?.providerType || '');
                 const tool: 'claude' | 'codex' = provider.includes('codex') ? 'codex' : 'claude';
-                const title = String(a?.label || '').trim() || sessionId.slice(0, 8);
+                // Live tab title wins over cached label — it's what the user actually sees.
+                const cacheLabel = String(a?.label || '').trim();
+                const title = liveTitleById.get(sessionId) || cacheLabel || sessionId.slice(0, 8);
                 const created = Number(a?.timing?.lastRequestEnded || a?.timing?.lastRequestStarted || a?.timing?.created || 0);
                 items.push({
                   sessionId,
@@ -555,6 +570,32 @@ async function collectChatHistory(workspacePath: string): Promise<HistoryItem[]>
     }
   } catch {
     // skip
+  }
+
+  // FALLBACK 3: any live Claude tab whose sessionId we discovered but no
+  // earlier source produced an item for — surface it with the tab title.
+  for (const [sessionId, title] of liveTitleById) {
+    if (seenIds.has(sessionId)) continue;
+    seenIds.add(sessionId);
+    items.push({
+      sessionId,
+      title: title.slice(0, 100),
+      tool: 'claude',
+      mtimeMs: Date.now(),
+      relativeTime: 'open now',
+    });
+  }
+
+  // Also: if an existing item has a UUID-ish/placeholder title but we have a
+  // real live title for that session, swap it in. Catches the "(untitled)" case.
+  for (const it of items) {
+    const live = liveTitleById.get(it.sessionId);
+    if (!live) continue;
+    const looksGeneric =
+      /\(untitled\)/i.test(it.title) ||
+      it.title === it.sessionId.slice(0, 8) ||
+      it.title.trim().length < 4;
+    if (looksGeneric) it.title = live.slice(0, 100);
   }
 
   // Newest first
